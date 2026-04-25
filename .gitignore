@@ -1,0 +1,33 @@
+# --- AI Spec-Kit ---
+.ai/checkpoint.json
+.env
+.env.*
+!.env.example
+
+# --- Node.js ---
+node_modules/
+dist/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+env/
+.pytest_cache/
+
+# --- Prisma ---
+/gateway/prisma/migrations/
+
+# --- Docker ---
+.docker-compose.override.yml
+
+# --- OS ---
+.DS_Store
+Thumbs.db
