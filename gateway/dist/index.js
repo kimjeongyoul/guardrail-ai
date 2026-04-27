@@ -1,100 +1,58 @@
 import Fastify from 'fastify';
 import * as dotenv from 'dotenv';
-import { PrismaClient } from '@prisma/client';
+import fastifyMetrics from 'fastify-metrics';
+import { Counter } from 'prom-client';
+import crypto from 'crypto';
+import { GuardRailProcessor } from './core.js';
 dotenv.config();
-const fastify = Fastify({
-    logger: true
+const fastify = Fastify({ logger: true });
+// --- Instantiate the Core Module ---
+const processor = new GuardRailProcessor({
+    privacyEngineUrl: process.env.PRIVACY_ENGINE_URL || 'http://privacy-engine:8000',
+    qdrantUrl: process.env.QDRANT_URL || 'http://qdrant:6333',
+    databaseUrl: process.env.DATABASE_URL,
+    openaiApiKey: process.env.OPENAI_API_KEY,
+    mockLlm: process.env.MOCK_LLM === 'true',
+    cacheEnabled: process.env.CACHE_ENABLED === 'true',
 });
-const prisma = new PrismaClient();
-const PORT = process.env.PORT || 3000;
-const PRIVACY_ENGINE_URL = process.env.PRIVACY_ENGINE_URL || 'http://localhost:8000';
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-// Health Check
+// Metrics Integration (Gateway specific)
+const cacheHitCounter = new Counter({
+    name: 'semantic_cache_hits_total',
+    help: 'Total cache hits',
+    labelNames: ['endpoint']
+});
+fastify.register(fastifyMetrics, { endpoint: '/metrics' });
+// --- API Routes ---
 fastify.get('/health', async () => {
-    return { status: 'OK', service: 'Gateway Core', version: '1.0.0' };
+    return { status: 'ALIVE', mode: 'HYBRID-GATEWAY', version: '6.0.0-MODULAR' };
 });
-// Privacy Engine Integration
-const checkPrivacy = async (content) => {
-    try {
-        const response = await fetch(`${PRIVACY_ENGINE_URL}/mask`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ text: content })
-        });
-        if (!response.ok) {
-            throw new Error(`Privacy Engine error: ${response.statusText}`);
-        }
-        const data = await response.json();
-        return {
-            masked: data.masked,
-            itemsFound: data.items_found || 0
-        };
-    }
-    catch (err) {
-        fastify.log.error({ err }, 'Privacy check failed, falling back to original content');
-        return { masked: content, itemsFound: 0 };
-    }
-};
-// LLM Proxy Route (OpenAI Style)
 fastify.post('/v1/chat/completions', async (request, reply) => {
-    const startTime = Date.now();
+    const traceId = request.headers['x-trace-id'] || crypto.randomUUID();
     const body = request.body;
-    let totalItemsMasked = 0;
-    if (!OPENAI_API_KEY) {
-        reply.status(500).send({ error: 'OpenAI API Key not configured' });
-        return;
-    }
-    // 1. Privacy Check (Masking)
-    if (body.messages && Array.isArray(body.messages)) {
-        fastify.log.info('Applying Privacy Shield to incoming messages...');
-        for (const msg of body.messages) {
-            if (msg.content && typeof msg.content === 'string') {
-                const result = await checkPrivacy(msg.content);
-                msg.content = result.masked;
-                totalItemsMasked += result.itemsFound;
-            }
-        }
-    }
-    // 2. Forward to OpenAI
-    try {
-        fastify.log.info('Forwarding masked request to OpenAI...');
-        const openAiResponse = await fetch('https://api.openai.com/v1/chat/completions', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${OPENAI_API_KEY}`
-            },
-            body: JSON.stringify(body)
-        });
-        const data = await openAiResponse.json();
-        const duration = Date.now() - startTime;
-        // 3. Asynchronous Audit Logging (Background)
-        const maskedPrompt = JSON.stringify(body.messages);
-        prisma.auditLog.create({
-            data: {
-                endpoint: '/v1/chat/completions',
-                masked_prompt: maskedPrompt,
-                items_masked: totalItemsMasked,
-                provider: 'openai',
-                model: body.model || 'unknown',
-                latency_ms: duration,
-                status_code: openAiResponse.status,
-            }
-        }).catch(err => fastify.log.error({ err }, 'Failed to save audit log'));
-        return reply.status(openAiResponse.status).send(data);
-    }
-    catch (err) {
-        fastify.log.error({ err }, 'Failed to proxy request to OpenAI');
-        return reply.status(500).send({ error: 'Failed to reach LLM provider' });
-    }
+    // 1. Module-based Authentication
+    const apiKey = request.headers['x-api-key'];
+    if (!apiKey)
+        return reply.status(401).send({ error: 'API Key missing' });
+    const isValid = await processor.validateKey(apiKey);
+    if (!isValid)
+        return reply.status(403).send({ error: 'Invalid API Key' });
+    // 2. Core Processing (The "Module" call)
+    const result = await processor.processChat(body, traceId);
+    // Update Gateway Metrics
+    if (result.cached)
+        cacheHitCounter.inc({ endpoint: '/v1/chat/completions' });
+    return reply
+        .status(result.statusCode)
+        .header('X-Trace-ID', result.traceId)
+        .send(result.responseData);
 });
 const start = async () => {
     try {
-        await fastify.listen({ port: Number(PORT), host: '0.0.0.0' });
-        console.log(`Gateway Core is running on http://localhost:${PORT}`);
+        const port = Number(process.env.PORT) || 3000;
+        await fastify.listen({ port, host: '0.0.0.0' });
+        console.log(`Modular Gateway running on ${port}`);
     }
     catch (err) {
-        fastify.log.error({ err }, 'Failed to start Gateway Core');
         process.exit(1);
     }
 };

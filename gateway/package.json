@@ -1,11 +1,20 @@
 {
-  "name": "gateway",
+  "name": "@guardrail/ai-core",
   "version": "1.0.0",
   "type": "module",
-  "description": "",
-  "main": "index.js",
+  "description": "Enterprise Secure LLM Gateway & SDK",
+  "main": "dist/core.js",
+  "types": "dist/core.d.ts",
+  "exports": {
+    ".": "./dist/core.js",
+    "./server": "./dist/index.js"
+  },
+  "bin": {
+    "guardrail-gateway": "dist/index.js"
+  },
   "scripts": {
-    "start": "ts-node src/index.ts",
+    "start": "node dist/index.js",
+    "dev": "ts-node src/index.ts",
     "build": "tsc",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
