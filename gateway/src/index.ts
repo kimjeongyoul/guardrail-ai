@@ -1,32 +1,21 @@
 import Fastify from 'fastify';
-import { PrismaClient } from '@prisma/client';
+import { z } from 'zod';
+import * as dotenv from 'dotenv';
 import fastifyMetrics from 'fastify-metrics';
 import { Counter, Histogram } from 'prom-client';
 import crypto from 'crypto';
-import * as dotenv from 'dotenv';
+import pg from 'pg';
 
 dotenv.config();
 
 const fastify = Fastify({ logger: true });
 
-/**
- * [BULLETPROOF PRISMA INITIALIZATION]
- * If Prisma fails, we return a "No-Op" object to prevent server crash.
- */
-let prisma: any;
-try {
-  prisma = new PrismaClient();
-  console.log('✅ Prisma Client initialized.');
-} catch (e) {
-  console.error('❌ FATAL PRISMA ERROR: Falling back to No-Op logging to keep gateway alive.');
-  prisma = {
-    apiKey: { findUnique: async () => ({ isActive: true, name: 'Bypass-Mode' }) },
-    auditLog: { create: async (data: any) => console.log('[AUDIT-LOG-FALLBACK]:', JSON.stringify(data)) },
-    $queryRaw: async () => { throw new Error('DB Down'); },
-    count: async () => 1
-  };
-}
+// --- Database Connection (Direct & Lightweight) ---
+const pool = new pg.Pool({
+  connectionString: process.env.DATABASE_URL,
+});
 
+// --- Custom Metrics ---
 const piiDetectedCounter = new Counter({
   name: 'pii_entities_detected_total',
   help: 'Total PII masked',
@@ -49,7 +38,7 @@ const llmLatencyHistogram = new Histogram({
 fastify.register(fastifyMetrics, { endpoint: '/metrics' });
 
 const PORT = process.env.PORT || 3000;
-const PRIVACY_ENGINE_URL = process.env.PRIVACY_ENGINE_URL || 'http://localhost:8000';
+const PRIVACY_ENGINE_URL = process.env.PRIVACY_ENGINE_URL || 'http://privacy-engine:8000';
 const QDRANT_URL = process.env.QDRANT_URL || 'http://localhost:6333';
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const MOCK_LLM = process.env.MOCK_LLM === 'true';
@@ -107,16 +96,19 @@ const checkPrivacy = async (content: string) => {
   } catch (err) { return { masked: content, itemsFound: 0 }; }
 };
 
-// --- Routes ---
+// --- API Routes ---
+
 fastify.get('/health', async () => {
-  let dbStatus = 'STABLE_OR_BYPASS';
+  let dbStatus = 'UP';
   try {
-    await prisma.$queryRaw`SELECT 1`;
-  } catch (e) { dbStatus = 'BYPASS_MODE_ACTIVE'; }
+    const client = await pool.connect();
+    await client.query('SELECT 1');
+    client.release();
+  } catch (e) { dbStatus = 'DOWN'; }
   
   return { 
     status: 'ALIVE', 
-    version: '2.0.0-UNBREAKABLE',
+    version: '4.0.0-PG-DIRECT',
     database_check: dbStatus,
     infra: { privacy_engine: PRIVACY_ENGINE_URL, qdrant: QDRANT_URL }
   };
@@ -128,15 +120,19 @@ fastify.post('/v1/chat/completions', async (request, reply) => {
   const userPrompt = body.messages?.find((m: any) => m.role === 'user')?.content || '';
   let promptVector: number[] = [];
 
-  // API Key Check (Safe-Wrapper handles bypass if DB is down)
-  const apiKey = request.headers['x-api-key'];
-  if (!apiKey) return reply.status(401).send({ error: 'Key missing' });
+  // 0. API Key Verification via Direct SQL
+  const apiKey = request.headers['x-api-key'] as string;
+  if (!apiKey) return reply.status(401).send({ error: 'API Key missing' });
   
   try {
-    const keyRecord = await prisma.apiKey.findUnique({ where: { key: apiKey } });
-    if (!keyRecord || !keyRecord.isActive) return reply.status(403).send({ error: 'Invalid Key' });
-  } catch (e) { /* Bypass auth if DB is in fatal error to keep service alive */ }
+    const res = await pool.query('SELECT * FROM "ApiKey" WHERE key = $1 AND "isActive" = true', [apiKey]);
+    if (res.rows.length === 0) return reply.status(403).send({ error: 'Invalid API Key' });
+  } catch (err) {
+    console.error('Auth DB Error:', err);
+    // Continue if DB is temporarily down to maintain service availability
+  }
 
+  // 1. Semantic Cache Lookup
   if (CACHE_ENABLED && userPrompt) {
     promptVector = await getEmbedding(userPrompt);
     const cachedResponse = await searchCache(promptVector);
@@ -146,20 +142,24 @@ fastify.post('/v1/chat/completions', async (request, reply) => {
     }
   }
 
+  // 2. Privacy Check
+  let itemsMasked = 0;
   if (body.messages) {
     for (const msg of body.messages) {
       if (msg.content) {
         const result = await checkPrivacy(msg.content);
         msg.content = result.masked;
+        itemsMasked += result.itemsFound;
       }
     }
   }
 
+  // 3. LLM Request
   try {
     let responseData: any;
     let statusCode: number;
     if (MOCK_LLM) {
-      responseData = { choices: [{ message: { role: 'assistant', content: 'UNBREAKABLE MOCK.' } }] };
+      responseData = { choices: [{ message: { role: 'assistant', content: 'DIRECT PG MOCK.' } }] };
       statusCode = 200;
     } else {
       const res = await fetch('https://api.openai.com/v1/chat/completions', {
@@ -172,34 +172,52 @@ fastify.post('/v1/chat/completions', async (request, reply) => {
     }
 
     const duration = Date.now() - startTime;
+
+    // 4. Save Cache
     if (CACHE_ENABLED && statusCode === 200 && promptVector.length > 0) {
       saveCache(promptVector, userPrompt, responseData).catch(() => {});
     }
 
+    // 5. Metrics & Audit Logging via Direct SQL
+    if (itemsMasked > 0) piiDetectedCounter.inc({ endpoint: '/v1/chat/completions' }, itemsMasked);
     llmLatencyHistogram.observe({ provider: MOCK_LLM ? 'mock' : 'openai', model: body.model || 'unknown', status_code: statusCode }, duration);
-    
-    // Non-crashing Audit Logging
-    prisma.auditLog.create({
-      data: {
-        endpoint: '/v1/chat/completions',
-        masked_prompt: JSON.stringify(body.messages),
-        items_masked: 0,
-        provider: MOCK_LLM ? 'mock' : 'openai',
-        model: body.model || 'unknown',
-        latency_ms: duration,
-        status_code: statusCode,
-      }
-    }).catch(() => {});
+
+    // Persist to DB (Non-blocking)
+    const auditQuery = `
+      INSERT INTO "AuditLog" (id, endpoint, masked_prompt, items_masked, provider, model, latency_ms, status_code)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+    `;
+    const auditValues = [
+      crypto.randomUUID(),
+      '/v1/chat/completions',
+      JSON.stringify(body.messages),
+      itemsMasked,
+      MOCK_LLM ? 'mock' : 'openai',
+      body.model || 'unknown',
+      duration,
+      statusCode
+    ];
+    pool.query(auditQuery, auditValues).catch(err => console.error('Audit Log DB Error:', err));
 
     return reply.status(statusCode).send(responseData);
-  } catch (err) { return reply.status(500).send({ error: 'Failed' }); }
+  } catch (err) { return reply.status(500).send({ error: 'LLM failed' }); }
 });
 
 const start = async () => {
   try {
     await fastify.listen({ port: Number(PORT), host: '0.0.0.0' });
-    console.log(`Gateway UNBREAKABLE on ${PORT}`);
-    
+    console.log(`Gateway DIRECT-PG on ${PORT}`);
+
+    // Seed Key if DB is empty (Direct SQL)
+    try {
+      const checkKey = await pool.query('SELECT count(*) FROM "ApiKey"');
+      if (parseInt(checkKey.rows[0].count) === 0) {
+        await pool.query('INSERT INTO "ApiKey" (id, key, name, owner_email) VALUES ($1, $2, $3, $4)', 
+                         [crypto.randomUUID(), 'test-key-123', 'Default', 'admin@ex.com']);
+        console.log('🔑 [SEED] Default API Key created via SQL.');
+      }
+    } catch (e) { console.warn('Seeding skipped (DB may not be ready)'); }
+
     if (CACHE_ENABLED) {
       await fetch(`${QDRANT_URL}/collections/semantic_cache`, {
         method: 'PUT',
