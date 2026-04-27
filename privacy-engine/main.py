@@ -1,29 +1,32 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from pydantic import BaseModel
 from presidio_analyzer import AnalyzerEngine
 from presidio_anonymizer import AnonymizerEngine
 from presidio_anonymizer.entities import OperatorConfig
 from sentence_transformers import SentenceTransformer
+import logging
+
+# Configure logging to include Trace ID
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: [%(trace_id)s] %(message)s')
+logger = logging.getLogger("privacy-engine")
 
 app = FastAPI()
 
-# Initialize Presidio engines
+# Initialize engines
 analyzer = AnalyzerEngine()
 anonymizer = AnonymizerEngine()
-
-# Initialize Embedding model (Lightweight and fast)
 embed_model = SentenceTransformer('all-MiniLM-L6-v2')
 
 class Content(BaseModel):
     text: str
 
-@app.get("/health")
-def health():
-    return {"status": "OK", "service": "Privacy Engine", "engine": "Presidio + SentenceTransformers"}
-
 @app.post("/mask")
-async def mask_content(content: Content):
-    # (기존 마스킹 로직 유지)
+async def mask_content(content: Content, request: Request):
+    trace_id = request.headers.get("X-Trace-ID", "unknown")
+    extra = {"trace_id": trace_id}
+    
+    logger.info(f"PII Masking initiated for content length: {len(content.text)}", extra=extra)
+    
     results = analyzer.analyze(text=content.text, language='en', 
                                entities=["PHONE_NUMBER", "EMAIL_ADDRESS", "PERSON", "LOCATION", "URL"])
     
@@ -37,15 +40,19 @@ async def mask_content(content: Content):
         operators=operators
     )
     
+    logger.info(f"PII Masking completed. Items found: {len(results)}", extra=extra)
+    
     return {
-        "original": content.text, 
         "masked": anonymized_result.text,
         "items_found": len(results)
     }
 
 @app.post("/embed")
-async def get_embedding(content: Content):
-    # Generate vector embedding for the text
+async def get_embedding(content: Content, request: Request):
+    trace_id = request.headers.get("X-Trace-ID", "unknown")
+    extra = {"trace_id": trace_id}
+    
+    logger.info("Generating embedding vector...", extra=extra)
     vector = embed_model.encode(content.text).tolist()
     return {"embedding": vector}
 

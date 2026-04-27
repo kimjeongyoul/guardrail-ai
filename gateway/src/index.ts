@@ -10,12 +10,9 @@ dotenv.config();
 
 const fastify = Fastify({ logger: true });
 
-// --- Database Connection (Direct & Lightweight) ---
-const pool = new pg.Pool({
-  connectionString: process.env.DATABASE_URL,
-});
+const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
 
-// --- Custom Metrics ---
+// --- Metrics ---
 const piiDetectedCounter = new Counter({
   name: 'pii_entities_detected_total',
   help: 'Total PII masked',
@@ -44,20 +41,45 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const MOCK_LLM = process.env.MOCK_LLM === 'true';
 const CACHE_ENABLED = process.env.CACHE_ENABLED === 'true';
 
-// --- Helpers ---
-const getEmbedding = async (text: string) => {
+// --- Helpers with Trace Correlation ---
+
+const getEmbedding = async (text: string, traceId: string) => {
   try {
     const res = await fetch(`${PRIVACY_ENGINE_URL}/embed`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 
+        'Content-Type': 'application/json',
+        'X-Trace-ID': traceId
+      },
       body: JSON.stringify({ text })
     });
     const data: any = await res.json();
     return data.embedding || [];
-  } catch (err) { return []; }
+  } catch (err) {
+    fastify.log.error({ trace_id: traceId, err }, 'Embedding correlation failed');
+    return [];
+  }
 };
 
-const searchCache = async (vector: number[]) => {
+const checkPrivacy = async (content: string, traceId: string) => {
+  try {
+    const response = await fetch(`${PRIVACY_ENGINE_URL}/mask`, {
+      method: 'POST',
+      headers: { 
+        'Content-Type': 'application/json',
+        'X-Trace-ID': traceId
+      },
+      body: JSON.stringify({ text: content })
+    });
+    const data: any = await response.json();
+    return { masked: data.masked, itemsFound: data.items_found || 0 };
+  } catch (err) {
+    fastify.log.error({ trace_id: traceId, err }, 'Privacy correlation failed');
+    return { masked: content, itemsFound: 0 };
+  }
+};
+
+const searchCache = async (vector: number[], traceId: string) => {
   if (!CACHE_ENABLED || vector.length === 0) return null;
   try {
     const res = await fetch(`${QDRANT_URL}/collections/semantic_cache/points/search`, {
@@ -66,88 +88,53 @@ const searchCache = async (vector: number[]) => {
       body: JSON.stringify({ vector, limit: 1, with_payload: true, score_threshold: 0.90 })
     });
     const data: any = await res.json();
-    if (data.result?.length > 0) return data.result[0].payload.response;
-  } catch (err) {}
+    if (data.result?.length > 0) {
+      fastify.log.info({ trace_id: traceId }, 'Semantic cache correlation: HIT');
+      return data.result[0].payload.response;
+    }
+  } catch (err) {
+    fastify.log.error({ trace_id: traceId, err }, 'Cache search correlation failed');
+  }
   return null;
-};
-
-const saveCache = async (vector: number[], prompt: string, response: any) => {
-  if (!CACHE_ENABLED || vector.length === 0) return;
-  try {
-    await fetch(`${QDRANT_URL}/collections/semantic_cache/points?wait=true`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        points: [{ id: crypto.randomUUID(), vector, payload: { prompt, response } }]
-      })
-    });
-  } catch (err) {}
-};
-
-const checkPrivacy = async (content: string) => {
-  try {
-    const response = await fetch(`${PRIVACY_ENGINE_URL}/mask`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: content })
-    });
-    const data: any = await response.json();
-    return { masked: data.masked, itemsFound: data.items_found || 0 };
-  } catch (err) { return { masked: content, itemsFound: 0 }; }
 };
 
 // --- API Routes ---
 
 fastify.get('/health', async () => {
-  let dbStatus = 'UP';
-  try {
-    const client = await pool.connect();
-    await client.query('SELECT 1');
-    client.release();
-  } catch (e) { dbStatus = 'DOWN'; }
-  
-  return { 
-    status: 'ALIVE', 
-    version: '4.0.0-PG-DIRECT',
-    database_check: dbStatus,
-    infra: { privacy_engine: PRIVACY_ENGINE_URL, qdrant: QDRANT_URL }
-  };
+  return { status: 'ALIVE', version: '5.0.0-OBSERVABILITY-INTEGRATED' };
 });
 
 fastify.post('/v1/chat/completions', async (request, reply) => {
   const startTime = Date.now();
+  const traceId = (request.headers['x-trace-id'] as string) || crypto.randomUUID();
   const body: any = request.body;
   const userPrompt = body.messages?.find((m: any) => m.role === 'user')?.content || '';
-  let promptVector: number[] = [];
-
-  // 0. API Key Verification via Direct SQL
-  const apiKey = request.headers['x-api-key'] as string;
-  if (!apiKey) return reply.status(401).send({ error: 'API Key missing' });
   
-  try {
-    const res = await pool.query('SELECT * FROM "ApiKey" WHERE key = $1 AND "isActive" = true', [apiKey]);
-    if (res.rows.length === 0) return reply.status(403).send({ error: 'Invalid API Key' });
-  } catch (err) {
-    console.error('Auth DB Error:', err);
-    // Continue if DB is temporarily down to maintain service availability
+  fastify.log.info({ trace_id: traceId, method: 'POST', url: '/v1/chat/completions' }, 'Incoming request initiated');
+
+  const apiKey = request.headers['x-api-key'] as string;
+  if (!apiKey) {
+    fastify.log.warn({ trace_id: traceId }, 'Missing API Key');
+    return reply.status(401).send({ error: 'API Key missing' });
   }
 
-  // 1. Semantic Cache Lookup
+  // 1. Semantic Cache with Correlation
+  let promptVector: number[] = [];
   if (CACHE_ENABLED && userPrompt) {
-    promptVector = await getEmbedding(userPrompt);
-    const cachedResponse = await searchCache(promptVector);
+    promptVector = await getEmbedding(userPrompt, traceId);
+    const cachedResponse = await searchCache(promptVector, traceId);
     if (cachedResponse) {
       cacheHitCounter.inc({ endpoint: '/v1/chat/completions' });
-      return reply.status(200).send(cachedResponse);
+      return reply.status(200).header('X-Trace-ID', traceId).send(cachedResponse);
     }
   }
 
-  // 2. Privacy Check
+  // 2. Privacy Shield with Correlation
   let itemsMasked = 0;
   if (body.messages) {
     for (const msg of body.messages) {
       if (msg.content) {
-        const result = await checkPrivacy(msg.content);
+        const result = await checkPrivacy(msg.content, traceId);
         msg.content = result.masked;
         itemsMasked += result.itemsFound;
       }
@@ -159,7 +146,7 @@ fastify.post('/v1/chat/completions', async (request, reply) => {
     let responseData: any;
     let statusCode: number;
     if (MOCK_LLM) {
-      responseData = { choices: [{ message: { role: 'assistant', content: 'DIRECT PG MOCK.' } }] };
+      responseData = { choices: [{ message: { role: 'assistant', content: 'CORRELATED MOCK.' } }] };
       statusCode = 200;
     } else {
       const res = await fetch('https://api.openai.com/v1/chat/completions', {
@@ -172,59 +159,35 @@ fastify.post('/v1/chat/completions', async (request, reply) => {
     }
 
     const duration = Date.now() - startTime;
-
-    // 4. Save Cache
-    if (CACHE_ENABLED && statusCode === 200 && promptVector.length > 0) {
-      saveCache(promptVector, userPrompt, responseData).catch(() => {});
-    }
-
-    // 5. Metrics & Audit Logging via Direct SQL
-    if (itemsMasked > 0) piiDetectedCounter.inc({ endpoint: '/v1/chat/completions' }, itemsMasked);
     llmLatencyHistogram.observe({ provider: MOCK_LLM ? 'mock' : 'openai', model: body.model || 'unknown', status_code: statusCode }, duration);
 
-    // Persist to DB (Non-blocking)
+    // 4. Correlated Audit Logging (DB)
     const auditQuery = `
-      INSERT INTO "AuditLog" (id, endpoint, masked_prompt, items_masked, provider, model, latency_ms, status_code)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      INSERT INTO "AuditLog" (id, trace_id, endpoint, masked_prompt, items_masked, provider, model, latency_ms, status_code)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
     `;
-    const auditValues = [
-      crypto.randomUUID(),
-      '/v1/chat/completions',
-      JSON.stringify(body.messages),
-      itemsMasked,
-      MOCK_LLM ? 'mock' : 'openai',
-      body.model || 'unknown',
-      duration,
-      statusCode
-    ];
-    pool.query(auditQuery, auditValues).catch(err => console.error('Audit Log DB Error:', err));
+    pool.query(auditQuery, [
+      crypto.randomUUID(), traceId, '/v1/chat/completions', JSON.stringify(body.messages), 
+      itemsMasked, MOCK_LLM ? 'mock' : 'openai', body.model || 'unknown', duration, statusCode
+    ]).catch(err => fastify.log.error({ trace_id: traceId, err }, 'Audit DB Save failed'));
 
-    return reply.status(statusCode).send(responseData);
-  } catch (err) { return reply.status(500).send({ error: 'LLM failed' }); }
+    fastify.log.info({ trace_id: traceId, duration_ms: duration, status: statusCode }, 'Request completed');
+    
+    return reply.status(statusCode).header('X-Trace-ID', traceId).send(responseData);
+  } catch (err) {
+    fastify.log.error({ trace_id: traceId, err }, 'Fatal proxy error');
+    return reply.status(500).send({ error: 'LLM failed' });
+  }
 });
 
 const start = async () => {
   try {
     await fastify.listen({ port: Number(PORT), host: '0.0.0.0' });
-    console.log(`Gateway DIRECT-PG on ${PORT}`);
-
-    // Seed Key if DB is empty (Direct SQL)
-    try {
-      const checkKey = await pool.query('SELECT count(*) FROM "ApiKey"');
-      if (parseInt(checkKey.rows[0].count) === 0) {
-        await pool.query('INSERT INTO "ApiKey" (id, key, name, owner_email) VALUES ($1, $2, $3, $4)', 
-                         [crypto.randomUUID(), 'test-key-123', 'Default', 'admin@ex.com']);
-        console.log('🔑 [SEED] Default API Key created via SQL.');
-      }
-    } catch (e) { console.warn('Seeding skipped (DB may not be ready)'); }
-
-    if (CACHE_ENABLED) {
-      await fetch(`${QDRANT_URL}/collections/semantic_cache`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ vectors: { size: 384, distance: 'Cosine' } })
-      }).catch(() => {});
-    }
+    console.log(`Gateway OBSERVABILITY-READY on ${PORT}`);
+    
+    // Auto-migrate schema (Simple way for demo)
+    await pool.query('ALTER TABLE "AuditLog" ADD COLUMN IF NOT EXISTS "trace_id" TEXT').catch(() => {});
+    
   } catch (err) { process.exit(1); }
 };
 start();

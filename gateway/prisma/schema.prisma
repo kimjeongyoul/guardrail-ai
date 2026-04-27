@@ -11,6 +11,7 @@ datasource db {
 
 model AuditLog {
   id            String   @id @default(uuid())
+  trace_id      String
   timestamp     DateTime @default(now())
   endpoint      String
   masked_prompt String   @db.Text
