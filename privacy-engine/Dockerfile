@@ -13,7 +13,11 @@ RUN pip install --no-cache-dir \
     uvicorn \
     presidio-analyzer \
     presidio-anonymizer \
-    spacy
+    spacy \
+    sentence-transformers
+
+# Install CPU version of torch separately to keep image slim
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
 
 # Download spacy model
 RUN python -m spacy download en_core_web_lg

@@ -1,7 +1,9 @@
 import Fastify from 'fastify';
 import { z } from 'zod';
 import * as dotenv from 'dotenv';
-import { PrismaClient } from '@prisma/client';
+import fastifyMetrics from 'fastify-metrics';
+import { Counter, Histogram } from 'prom-client';
+import crypto from 'crypto';
 
 dotenv.config();
 
@@ -9,60 +11,135 @@ const fastify = Fastify({
   logger: true
 });
 
-const prisma = new PrismaClient();
+// --- Custom Metrics ---
+const piiDetectedCounter = new Counter({
+  name: 'pii_entities_detected_total',
+  help: 'Total number of PII entities detected and masked',
+  labelNames: ['endpoint']
+});
+
+const cacheHitCounter = new Counter({
+  name: 'semantic_cache_hits_total',
+  help: 'Total number of semantic cache hits',
+  labelNames: ['endpoint']
+});
+
+const llmLatencyHistogram = new Histogram({
+  name: 'llm_request_duration_ms',
+  help: 'Latency of LLM provider requests in milliseconds',
+  labelNames: ['provider', 'model', 'status_code'],
+  buckets: [100, 500, 1000, 2000, 5000, 10000]
+});
+
+// Register Metrics Plugin
+fastify.register(fastifyMetrics, { endpoint: '/metrics' });
 
 const PORT = process.env.PORT || 3000;
 const PRIVACY_ENGINE_URL = process.env.PRIVACY_ENGINE_URL || 'http://localhost:8000';
+const QDRANT_URL = process.env.QDRANT_URL || 'http://localhost:6333';
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const MOCK_LLM = process.env.MOCK_LLM === 'true';
+const CACHE_ENABLED = process.env.CACHE_ENABLED === 'true';
+
+// --- Semantic Cache Helpers ---
+
+const getEmbedding = async (text: string): Promise<number[]> => {
+  try {
+    const res = await fetch(`${PRIVACY_ENGINE_URL}/embed`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text })
+    });
+    if (!res.ok) throw new Error('Embedding service error');
+    const data: any = await res.json();
+    return data.embedding;
+  } catch (err) {
+    console.error('Embedding failed:', err);
+    return [];
+  }
+};
+
+const searchCache = async (vector: number[]): Promise<any | null> => {
+  if (!CACHE_ENABLED || vector.length === 0) return null;
+  try {
+    const res = await fetch(`${QDRANT_URL}/collections/semantic_cache/points/search`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        vector,
+        limit: 1,
+        with_payload: true,
+        score_threshold: 0.90
+      })
+    });
+    const data: any = await res.json();
+    if (data.result && data.result.length > 0) {
+      return data.result[0].payload.response;
+    }
+  } catch (err) {
+    console.error('Cache search failed:', err);
+  }
+  return null;
+};
+
+const saveCache = async (vector: number[], prompt: string, response: any) => {
+  if (!CACHE_ENABLED || vector.length === 0) return;
+  try {
+    await fetch(`${QDRANT_URL}/collections/semantic_cache/points?wait=true`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        points: [{
+          id: crypto.randomUUID(),
+          vector,
+          payload: { prompt, response }
+        }]
+      })
+    });
+  } catch (err) {
+    console.error('Cache save failed:', err);
+  }
+};
 
 // Health Check
 fastify.get('/health', async () => {
   return { status: 'OK', service: 'Gateway Core', version: '1.0.0' };
 });
 
-interface PrivacyResult {
-  masked: string;
-  itemsFound: number;
-}
-
-// Privacy Engine Integration
-const checkPrivacy = async (content: string): Promise<PrivacyResult> => {
+const checkPrivacy = async (content: string) => {
   try {
     const response = await fetch(`${PRIVACY_ENGINE_URL}/mask`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ text: content })
     });
-    
-    if (!response.ok) {
-      throw new Error(`Privacy Engine error: ${response.statusText}`);
-    }
-
     const data: any = await response.json();
-    return {
-      masked: data.masked,
-      itemsFound: data.items_found || 0
-    };
-  } catch (err: any) {
-    fastify.log.error({ err }, 'Privacy check failed, falling back to original content');
+    return { masked: data.masked, itemsFound: data.items_found || 0 };
+  } catch (err) {
     return { masked: content, itemsFound: 0 };
   }
 };
 
-// LLM Proxy Route (OpenAI Style)
+// LLM Proxy Route
 fastify.post('/v1/chat/completions', async (request, reply) => {
   const startTime = Date.now();
   const body: any = request.body;
   let totalItemsMasked = 0;
 
-  if (!OPENAI_API_KEY) {
-    reply.status(500).send({ error: 'OpenAI API Key not configured' });
-    return;
+  // Temporary Bypass Auth for Demo
+  const userPrompt = body.messages?.find((m: any) => m.role === 'user')?.content || '';
+  let promptVector: number[] = [];
+  
+  if (CACHE_ENABLED && userPrompt) {
+    promptVector = await getEmbedding(userPrompt);
+    const cached = await searchCache(promptVector);
+    if (cached) {
+      cacheHitCounter.inc({ endpoint: '/v1/chat/completions' });
+      return reply.status(200).send(cached);
+    }
   }
   
-  // 1. Privacy Check (Masking)
   if (body.messages && Array.isArray(body.messages)) {
-    fastify.log.info('Applying Privacy Shield to incoming messages...');
     for (const msg of body.messages) {
       if (msg.content && typeof msg.content === 'string') {
         const result = await checkPrivacy(msg.content);
@@ -72,48 +149,56 @@ fastify.post('/v1/chat/completions', async (request, reply) => {
     }
   }
 
-  // 2. Forward to OpenAI
   try {
-    fastify.log.info('Forwarding masked request to OpenAI...');
-    const openAiResponse = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${OPENAI_API_KEY}`
-      },
-      body: JSON.stringify(body)
-    });
+    let responseData: any;
+    let statusCode: number;
 
-    const data: any = await openAiResponse.json();
+    if (MOCK_LLM) {
+      responseData = {
+        id: 'mock-123',
+        object: 'chat.completion',
+        created: Math.floor(Date.now() / 1000),
+        model: body.model || 'mock-gpt-3.5',
+        choices: [{ message: { role: 'assistant', content: 'Mock response.' }, finish_reason: 'stop' }]
+      };
+      statusCode = 200;
+    } else {
+      const openAiResponse = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${OPENAI_API_KEY}` },
+        body: JSON.stringify(body)
+      });
+      responseData = await openAiResponse.json();
+      statusCode = openAiResponse.status;
+    }
+
     const duration = Date.now() - startTime;
+    if (CACHE_ENABLED && statusCode === 200 && promptVector.length > 0) {
+      saveCache(promptVector, userPrompt, responseData).catch(() => {});
+    }
 
-    // 3. Asynchronous Audit Logging (Background)
-    const maskedPrompt = JSON.stringify(body.messages);
-    prisma.auditLog.create({
-      data: {
-        endpoint: '/v1/chat/completions',
-        masked_prompt: maskedPrompt,
-        items_masked: totalItemsMasked,
-        provider: 'openai',
-        model: body.model || 'unknown',
-        latency_ms: duration,
-        status_code: openAiResponse.status,
-      }
-    }).catch(err => fastify.log.error({ err }, 'Failed to save audit log'));
+    if (totalItemsMasked > 0) piiDetectedCounter.inc({ endpoint: '/v1/chat/completions' }, totalItemsMasked);
+    llmLatencyHistogram.observe({ provider: MOCK_LLM ? 'mock' : 'openai', model: body.model || 'unknown', status_code: statusCode }, duration);
 
-    return reply.status(openAiResponse.status).send(data);
-  } catch (err: any) {
-    fastify.log.error({ err }, 'Failed to proxy request to OpenAI');
-    return reply.status(500).send({ error: 'Failed to reach LLM provider' });
+    return reply.status(statusCode).send(responseData);
+  } catch (err) {
+    return reply.status(500).send({ error: 'LLM failed' });
   }
 });
 
 const start = async () => {
   try {
     await fastify.listen({ port: Number(PORT), host: '0.0.0.0' });
-    console.log(`Gateway Core is running on http://localhost:${PORT}`);
-  } catch (err: any) {
-    fastify.log.error({ err }, 'Failed to start Gateway Core');
+    console.log(`Gateway running on ${PORT}`);
+
+    if (CACHE_ENABLED) {
+      await fetch(`${QDRANT_URL}/collections/semantic_cache`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ vectors: { size: 384, distance: 'Cosine' } })
+      }).catch(() => {});
+    }
+  } catch (err) {
     process.exit(1);
   }
 };

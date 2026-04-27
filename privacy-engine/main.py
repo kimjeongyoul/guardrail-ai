@@ -3,6 +3,7 @@ from pydantic import BaseModel
 from presidio_analyzer import AnalyzerEngine
 from presidio_anonymizer import AnonymizerEngine
 from presidio_anonymizer.entities import OperatorConfig
+from sentence_transformers import SentenceTransformer
 
 app = FastAPI()
 
@@ -10,21 +11,22 @@ app = FastAPI()
 analyzer = AnalyzerEngine()
 anonymizer = AnonymizerEngine()
 
+# Initialize Embedding model (Lightweight and fast)
+embed_model = SentenceTransformer('all-MiniLM-L6-v2')
+
 class Content(BaseModel):
     text: str
 
 @app.get("/health")
 def health():
-    return {"status": "OK", "service": "Privacy Engine", "engine": "Presidio"}
+    return {"status": "OK", "service": "Privacy Engine", "engine": "Presidio + SentenceTransformers"}
 
 @app.post("/mask")
 async def mask_content(content: Content):
-    # 1. Analyze text for PII
+    # (기존 마스킹 로직 유지)
     results = analyzer.analyze(text=content.text, language='en', 
                                entities=["PHONE_NUMBER", "EMAIL_ADDRESS", "PERSON", "LOCATION", "URL"])
     
-    # 2. Anonymize/Mask the identified PII
-    # We can customize operators, e.g., replace with <MASKED_ENTITY_TYPE>
     operators = {
         "DEFAULT": OperatorConfig("replace", {"new_value": "<MASKED>"}),
     }
@@ -40,6 +42,12 @@ async def mask_content(content: Content):
         "masked": anonymized_result.text,
         "items_found": len(results)
     }
+
+@app.post("/embed")
+async def get_embedding(content: Content):
+    # Generate vector embedding for the text
+    vector = embed_model.encode(content.text).tolist()
+    return {"embedding": vector}
 
 if __name__ == "__main__":
     import uvicorn

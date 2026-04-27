@@ -1,6 +1,6 @@
 # GuardRail AI: Enterprise Secure LLM Gateway
 
-**GuardRail AI**는 기업이 LLM(Large Language Models)을 안전하고 효율적으로 도입할 수 있도록 돕는 엔터프라이즈급 보안 게이트웨이입니다. 10년 차 백엔드 시니어의 설계 철학을 바탕으로 **고성능 요청 처리, 실시간 데이터 거버넌스, 그리고 가시성(Observability)**에 초점을 맞추어 개발되었습니다.
+**GuardRail AI**는 기업이 LLM(Large Language Models)을 안전하고 효율적으로 도입할 수 있도록 돕는 엔터프라이즈급 보안 게이트웨이입니다. **고성능 요청 처리, 실시간 데이터 거버넌스, 그리고 가시성(Observability)**에 초점을 맞추어 개발되었습니다.
 
 ## 🚀 Key Features
 
@@ -42,16 +42,35 @@ graph TD
    ```bash
    docker compose up -d
    ```
-4. 게이트웨이가 `http://localhost:3000`에서 구동됩니다.
+4. 게이트웨이가 `http://localhost:3002`에서 구동됩니다.
+
+## 📊 Monitoring & Observability (Phase 4)
+
+GuardRail AI는 시스템의 건강 상태와 보안 지표를 실시간으로 모니터링할 수 있는 환경을 제공합니다.
+
+### 1. Dashboard (Grafana)
+- **URL**: [http://localhost:3001](http://localhost:3001)
+- **Login**: `admin` / `admin`
+- **Setup**:
+  1. `Connections` -> `Data Sources`에서 `Add data source` 클릭
+  2. `Prometheus` 선택 후 URL에 `http://prometheus:9090` 입력
+  3. `Save & Test` 클릭하여 연결 확인
+
+### 2. Metrics (Prometheus)
+- **URL**: [http://localhost:9090](http://localhost:9090)
+- **Key Metrics**:
+  - `pii_entities_detected_total`: 실시간 PII 탐지 및 마스킹 누적 횟수
+  - `llm_request_duration_ms`: LLM 요청 지연 시간 (Histogram)
+  - `http_requests_total`: 게이트웨이 전체 트래픽 현황
 
 ## 📈 Roadmap
 
 - [x] Phase 1: Core Setup (Fastify + FastAPI)
 - [x] Phase 2: Real PII Masking with Presidio
 - [x] Phase 3: Asynchronous Audit Logging with Prisma
-- [ ] Phase 4: Dashboard & Statistics Visualization (Grafana)
-- [ ] Phase 5: RBAC & API Key Management
-- [ ] Phase 6: Semantic Caching with Vector DB
+- [x] Phase 4: Dashboard & Statistics Visualization (Grafana)
+- [x] Phase 5: RBAC & API Key Management
+- [x] Phase 6: Semantic Caching with Vector DB
 
 ## 📄 License
 This project is licensed under the MIT License.

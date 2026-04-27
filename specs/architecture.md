@@ -1,7 +1,7 @@
 # Architecture Specification: GuardRail AI (Enterprise Secure Gateway)
 
 ## 1. System Overview
-GuardRail AI는 기업 내부 사용자와 외부 LLM(OpenAI, Anthropic 등) 사이에서 동작하는 **엔터프라이즈급 보안 게이트웨이**입니다. 10년 차 백엔드 시니어의 역량을 보여줄 수 있도록 **고성능 요청 처리, 데이터 거버넌스(PII 마스킹), 비용 최적화(Semantic Cache), 그리고 가시성(Observability)**에 초점을 맞춥니다.
+GuardRail AI는 기업 내부 사용자와 외부 LLM(OpenAI, Anthropic 등) 사이에서 동작하는 **엔터프라이즈급 보안 게이트웨이**입니다. **고성능 요청 처리, 데이터 거버넌스(PII 마스킹), 비용 최적화(Semantic Cache), 그리고 가시성(Observability)**에 초점을 맞춥니다.
 
 ## 2. Technical Stack & Rationale
 - **Gateway Core**: **Node.js (TypeScript + Fastify)** - 고성능 비동기 I/O 처리 및 풍부한 에코시스템을 위해 선택. Fastify는 Node.js 환경에서 가장 빠른 웹 프레임워크 중 하나입니다.
